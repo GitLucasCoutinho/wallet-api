@@ -1,0 +1,97 @@
+### Wallet API - exemplos de requisição (IntelliJ HTTP Client / VS Code REST Client)
+### Requer o ambiente no ar: docker compose up --build -d
+@host = http://localhost:8080
+@apiKey = local-dev-key
+@walletId = 1000
+
+### Health (público)
+GET {{host}}/actuator/health
+
+### Criar carteira
+POST {{host}}/api/v1/wallets
+X-API-Key: {{apiKey}}
+Content-Type: application/json
+
+{
+  "holderName": "Ana Souza",
+  "holderDocument": "12345678900"
+}
+
+### Consultar saldo
+GET {{host}}/api/v1/wallets/{{walletId}}
+X-API-Key: {{apiKey}}
+
+### Crédito
+POST {{host}}/api/v1/wallets/{{walletId}}/transactions
+X-API-Key: {{apiKey}}
+Content-Type: application/json
+Idempotency-Key: pix-2026-01-02-0001
+
+{
+  "type": "CREDIT",
+  "amount": 150.75,
+  "description": "Pix recebido"
+}
+
+### Repetir a mesma requisição (deve retornar 200 + Idempotent-Replayed: true)
+POST {{host}}/api/v1/wallets/{{walletId}}/transactions
+X-API-Key: {{apiKey}}
+Content-Type: application/json
+Idempotency-Key: pix-2026-01-02-0001
+
+{
+  "type": "CREDIT",
+  "amount": 150.75,
+  "description": "Pix recebido"
+}
+
+### Mesma chave, valor diferente (deve retornar 409)
+POST {{host}}/api/v1/wallets/{{walletId}}/transactions
+X-API-Key: {{apiKey}}
+Content-Type: application/json
+Idempotency-Key: pix-2026-01-02-0001
+
+{
+  "type": "CREDIT",
+  "amount": 151.75,
+  "description": "Pix recebido"
+}
+
+### Débito válido
+POST {{host}}/api/v1/wallets/{{walletId}}/transactions
+X-API-Key: {{apiKey}}
+Content-Type: application/json
+Idempotency-Key: ted-2026-01-02-0001
+
+{
+  "type": "DEBIT",
+  "amount": 50.25,
+  "description": "Ted enviada"
+}
+
+### Débito sem saldo (deve retornar 422)
+POST {{host}}/api/v1/wallets/{{walletId}}/transactions
+X-API-Key: {{apiKey}}
+Content-Type: application/json
+Idempotency-Key: ted-2026-01-02-0002
+
+{
+  "type": "DEBIT",
+  "amount": 999999.00,
+  "description": "Ted acima do saldo"
+}
+
+### Extrato paginado
+GET {{host}}/api/v1/wallets/{{walletId}}/transactions?page=0&size=20
+X-API-Key: {{apiKey}}
+
+### Extrato filtrado por período e tipo
+GET {{host}}/api/v1/wallets/{{walletId}}/transactions?from=2026-01-01T00:00:00Z&to=2026-02-01T00:00:00Z&type=CREDIT
+X-API-Key: {{apiKey}}
+
+### Sem API key (deve retornar 401)
+GET {{host}}/api/v1/wallets/{{walletId}}
+
+### Carteira inexistente (deve retornar 404)
+GET {{host}}/api/v1/wallets/999999999
+X-API-Key: {{apiKey}}
