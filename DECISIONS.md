@@ -276,6 +276,25 @@ Em ordem de valor, e sem mudar o desenho atual:
 8. **`Retry-After`** nas respostas 503 e um retry limitado no cliente para deadlock.
 9. **Partição por mês** em `WALLET_TRANSACTION` quando o volume justificar, mantendo o índice local.
 
+### O que eu faria diferente
+
+Não é só "o que vem depois": são escolhas que eu refaria se começasse hoje, com o conhecimento que
+o projeto me deu.
+
+1. **Logs estruturados desde o primeiro endpoint.** Entraram como feature no fim (ADR-14). Se
+   nascessem junto com o `register_transaction`, eu teria visto antes que faltava `walletId` em log
+   de recusa, e não depois de escrever o teste que expôs a falta.
+2. **Keyset pagination no extrato desde o início** em vez de `OFFSET`. Funciona e está dentro do
+   limite de 100 por página, mas trocar depois exige mudar contrato com o cliente; nascer com cursor
+   custaria o mesmo esforço que o offset custou (ADR-10).
+3. **Um value object `Money` no domínio** em vez de `BigDecimal` + utilitário `Amounts`. Hoje a
+   regra de escala está no utilitário, no DTO e no banco, mas não no tipo: nada impede passar um
+   `BigDecimal` não normalizado adiante. Um VO com `of(String)` fecharia isso na assinatura.
+4. **Bootstrap separado do banco.** A criação de usuários e do objeto de auditoria vive num init
+   script do Oracle (ADR-7). Faria como um passo de infraestrutura explícito (job de compose com o
+   usuário de migração), para que o banco suba sem DDL embutido e o Flyway seja o único dono de
+   schema.
+
 ---
 
 ## ADR-12: Mock maker subclass nos testes
