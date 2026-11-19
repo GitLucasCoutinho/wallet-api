@@ -267,8 +267,9 @@ Em ordem de valor, e sem mudar o desenho atual:
 3. **Job de conciliação (`DBMS_SCHEDULER`)** comparando `SUM(extrato) = saldo` e registrando
    divergências na auditoria; a trilha já tem todos os dados necessários.
 4. **Keyset pagination** no extrato e projeção `content` sem `description` quando não pedida.
-5. **Observabilidade**: métricas Micrometer por resultado (`applied`, `replayed`, `rejected`,
-   `conflict`), contador de retries por `ORA-00060`, e logs estruturados em JSON.
+5. **Observabilidade**: tracing distribuído com OTel, alertas sobre a taxa de
+   `insufficient_funds` e de `idempotency_conflict`, e contador de retries por `ORA-00060`.
+   Logs JSON e métricas de negócio já estão implementados (ADR-14).
 6. **Teste de carga (k6)** com N operações concorrentes por carteira, imprimindo o confronto entre
    saldo final, extrato e auditoria; o teste de integração já faz isso em escala pequena (20/8).
 7. **API keys com hash e escopos**, rotação e `X-API-Key` por cliente, mantendo o filtro atual.
@@ -298,15 +299,51 @@ instrumentação inline esteja sendo usada para estes testes.
 
 ## ADR-13: Testcontainers 1.21.4 (negociação de API com Docker recente)
 
-**Decisão.** O pom.xml fixa 	estcontainers.version em 1.21.4 (o Spring Boot 3.5.6 gerencia
-1.21.3).
+**Decisão.** O `pom.xml` fixa `testcontainers.version` em `1.21.4` (o Spring Boot 3.5.6 gerencia
+`1.21.3`).
 
 **Por quê.** Com o Docker Engine 29 (Docker Desktop 4.88), o cliente embutido na 1.21.3 negocia uma
-versão de API que o engine recusa com 400 Bad Request sem mensagem, e o Testcontainers conclui que
-"não existe ambiente Docker" e os testes de integração são **ignorados** em vez de executados. A
-1.21.4 negocia corretamente com o engine atual; com ela a suíte de integração roda de ponta a ponta
-(verificado com gvenzl/oracle-free:23.26.4-slim-faststart).
+versão de API que o engine recusa com `400 Bad Request` sem mensagem, e o Testcontainers conclui
+que "não existe ambiente Docker" e os testes de integração são **ignorados** em vez de executados.
+A 1.21.4 negocia corretamente com o engine atual; com ela a suíte de integração roda de ponta a
+ponta (verificado com `gvenzl/oracle-free:23.26.4-slim-faststart`).
 
 **Consequência.** Um override de versão para acompanhar o engine; quando o Spring Boot passar a
 gerenciar uma versão equivalente ou superior, o override pode ser removido. Sem Docker, os testes
-continuam sendo ignorados de forma limpa (disabledWithoutDocker = true).
+continuam sendo ignorados de forma limpa (`disabledWithoutDocker = true`).
+
+---
+
+## ADR-14: Observabilidade com logs JSON e métricas de negócio
+
+**Decisão.** Três camadas, todas nativas do Spring Boot, sem agente externo:
+
+1. logs em JSON por linha no formato ECS (`logging.structured.format.console=ecs`), com `requestId`
+   vindo do filtro e `walletId` mais `idempotencyKey` colocados no MDC pelo caso de uso;
+2. métricas de negócio no Micrometer: contador `wallet.operations` e timer `wallet.operation.duration`,
+   ambos com as tags `operation`, `outcome` e `type`, expostos em `/actuator/prometheus`;
+3. política de severidade: 5xx em ERROR com stack, 409 e 422 em WARN com código e caminho, 400 em
+   DEBUG, operação aplicada ou replay em INFO.
+
+**Por quê.** Auditoria no banco resolve o "o que aconteceu com este saldo", mas não responde "o
+serviço está pior agora do que ontem", "quem está gerando 409" ou "em qual linha do package
+quebrou". Sem isso, um erro em produção vira arqueologia: olhar log de texto, tentar casar
+horário com requisição e adivinhar a carteira. Com as três camadas, cada uma dessas perguntas é
+uma consulta.
+
+**Alternativas consideradas.**
+
+| Alternativa | Por que não |
+|---|---|
+| Log de texto com `requestId` (o que existia) | não dá para filtrar por campo sem parsear; cada ferramenta de busca teria um regex diferente |
+| Tracing distribuído (OTel) | resolveria latência ponta a ponta, mas não há coletor no compose e o valor para um serviço único é menor que o custo operacional; registrado como próximo passo |
+| Métricas de infraestrutura apenas (`http.server.requests`) | mostram que há erro 422, não *por que*: a distribuição por desfecho é o que separa "cliente sem saldo" de "cliente reusando chave" |
+| Publicar evento em fila para telemetria | telemetria não é o caso de uso, e evento transacional exigiria outbox (ver ADR-2 e a seção de escopo) |
+| `DBMS_APPLICATION_INFO` para amarrar `v$session` ao request | caro por chamada (round trip extra) e desnecessário: a trilha de auditoria já identifica a transação e o usuário |
+
+**Consequências.** Positivo: diagnóstico em uma consulta, e a métrica de desfecho também serve de
+alarme (variação de `insufficient_funds` ou de `idempotency_conflict` indica mudança de
+comportamento do cliente, não do serviço). Negativo: cardinalidade controlada por três tags
+conhecidas, mas qualquer tag nova precisa ser limitada; o log JSON é menos legível no terminal,
+então o README mostra o filtro com `jq`. Sem mensageria, por decisão explícita: o enunciado descreve
+um serviço HTTP e não pede eventos; publicar fora da transação abriria divergência de saldo.

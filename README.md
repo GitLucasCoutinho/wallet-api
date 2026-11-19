@@ -25,6 +25,7 @@ cliente ──HTTP──> Spring Boot ──JDBC──> PKG_WALLET (PL/SQL) ─�
 | Migrações | Flyway 11 (DDL, PL/SQL, triggers e grants versionados) |
 | Documentação | springdoc-openapi 2.8.6 (`/swagger-ui.html`, `/v3/api-docs`) |
 | Persistência | JDBC (`JdbcTemplate` + `CallableStatement`), sem JPA (ver [DECISIONS.md](DECISIONS.md)) |
+| Observabilidade | Actuator (health, metrics), Micrometer com Prometheus e logs JSON em ECS |
 | Testes | JUnit 5, AssertJ, MockMvc e Testcontainers (Oracle real) |
 
 ---
@@ -49,6 +50,7 @@ de começar a atender. Acompanhe com `docker compose logs -f app`.
 * Swagger UI: <http://localhost:8080/swagger-ui.html>
 * OpenAPI JSON: <http://localhost:8080/v3/api-docs>
 * Health: <http://localhost:8080/actuator/health> (público, usado pelo healthcheck)
+* Métricas: <http://localhost:8080/actuator/metrics> e <http://localhost:8080/actuator/prometheus> (com `X-API-Key`)
 * Oracle: `localhost:1521`, serviço `FREEPDB1`
 
 Para zerar o banco: `docker compose down -v`.
@@ -251,6 +253,7 @@ curl -s 'http://localhost:8080/api/v1/wallets/1000/transactions?page=0&size=20&t
 | `RESOURCE_NOT_FOUND` | 404 | rota inexistente |
 | `METHOD_NOT_ALLOWED` | 405 | método não suportado na rota |
 | `UNSUPPORTED_MEDIA_TYPE` | 415 | `Content-Type` diferente de `application/json` |
+| `NOT_ACCEPTABLE` | 406 | `Accept` sem representação disponível (ex.: `application/xml`) |
 | `IDEMPOTENCY_CONFLICT` | 409 | mesma chave, payload diferente |
 | `INSUFFICIENT_FUNDS` | 422 | débito maior que o saldo |
 | `CONCURRENT_MODIFICATION` | 503 | deadlock/serialização: seguro repetir |
@@ -404,26 +407,106 @@ Provas automatizadas (`WalletApiIT`):
 * 8 envios simultâneos da mesma operação/chave ⇒ **1** aplicado, 7 replays, mesmo `transactionId`,
   saldo afetado uma única vez.
 * `UPDATE`/`DELETE` no extrato como `WALLET_OWNER` ⇒ `ORA-20010`.
-* `WALLET_APP` tentando `INSERT`/`UPDATE`/`DELETE` ⇒ `ORA-01031`; lendo `WALLET_AUDIT` ⇒ `ORA-00942`.
+* `WALLET_APP` tentando `INSERT`/`UPDATE`/`DELETE` ⇒ privilégio negado (`ORA-01031`; no 23ai aparece como `ORA-41900`); lendo `WALLET_AUDIT` ⇒ `ORA-00942`.
 * Trilha de auditoria conferida linha a linha (soma dos deltas = saldo; `transaction_id` presente
   nas operações da API e nulo em alteração manual de DBA).
 
 ---
 
-## 7. Testes
+## 7. Observabilidade e diagnóstico
+
+### 7.1 Logs
+
+Saída em JSON, uma linha por evento (formato ECS, nativo do Spring Boot 3.5). Todo request carrega
+`requestId`; as operações carregam também `walletId` e `idempotencyKey` no MDC, então dá para filtrar
+por qualquer um deles sem parsear texto.
+
+```json
+{"@timestamp":"2026-11-18T13:12:41.101Z","log":{"level":"INFO","logger":"com.wallet.api.application.WalletApplicationService"},"process":{"pid":16276,"thread":{"name":"http-nio-auto-1-exec-2"}},"service":{"name":"wallet-api","node":{}},"message":"operation applied transactionId=26 type=CREDIT amount=150.75 balanceAfter=150.75","walletId":"1004","requestId":"a88813d1-1246-47b2-a3bf-0aea208c0596","idempotencyKey":"fmt-000001","ecs":{"version":"8.11"}}
+```
 
 ```bash
-mvn test      # 71 testes: domínio, serviço, contrato HTTP (MockMvc) - não precisa de banco
+docker compose logs -f app | jq -R 'fromjson? | select(.walletId=="1004")'
+```
+
+Política de severidade, para o log não virar ruído:
+
+| Situação | Nível | O que vai na linha |
+|---|---|---|
+| operação aplicada ou replay | INFO | `transactionId`, `type`, `amount`, `balanceAfter` |
+| recusa de negócio (409, 422) | WARN | `code`, `detail`, `path`, `walletId`, `idempotencyKey` |
+| falha de infraestrutura ou bug (5xx) | ERROR | stack trace completo, `code`, `path` |
+| 400 de validação | DEBUG | `code`, `path` |
+
+### 7.2 Métricas
+
+Em `/actuator/metrics` e `/actuator/prometheus`. Os dois exigem `X-API-Key`, como qualquer endpoint fora de health, info e docs.
+
+| Métrica | Tags | Para que serve |
+|---|---|---|
+| `wallet.operations` (counter) | `operation`, `outcome`, `type` | distribuição de resultado: `applied`, `replayed`, `insufficient_funds`, `idempotency_conflict`, `error` |
+| `wallet.operation.duration` (timer) | mesmas | latência por desfecho |
+| `http.server.requests` | `uri`, `status`, `method` | latência e erro por endpoint |
+| `hikaricp.connections.*` | `pool` | saturação do pool |
+
+```promql
+# resultado das operações por desfecho
+sum by (outcome) (rate(wallet_operations_total[5m]))
+
+# p95 da operação que pega o lock da carteira
+histogram_quantile(0.95, sum by (le) (rate(wallet_operation_duration_seconds_bucket[5m])))
+```
+
+### 7.3 Como investigar em um minuto
+
+| Sintoma | Onde olhar |
+|---|---|
+| 422 subindo | `wallet_operations_total{outcome="insufficient_funds"}` e o WARN com `walletId` |
+| 409 aparecendo | `outcome="idempotency_conflict"`: cliente reusando chave com outro payload |
+| 500 | linha ERROR com `ORA-xxxxx` e `traceId`; código fora de 20001..20011 é infraestrutura, não regra |
+| lentidão | timer por desfecho e `hikaricp_connections_pending`; contenção de carteira aparece como p95 alto só em `register_transaction` |
+| saldo divergente | consulta de conciliação abaixo |
+
+Erro de PL/SQL chega com o código `ORA-20xxx` e a linha do package (`ORA-06512: at
+"WALLET_OWNER.PKG_WALLET", line N`), o que aponta o trecho exato a corrigir. O `traceId` da resposta
+é o mesmo `requestId` do log, então a correlação entre cliente e servidor é direta.
+
+Conciliação de saldo contra o extrato, para rodar como `WALLET_AUDIT` (que tem `SELECT` nos dois
+lados e não enxerga a aplicação):
+
+```sql
+SELECT w.id,
+       w.balance,
+       NVL(SUM(CASE t.type WHEN 'CREDIT' THEN t.amount ELSE -t.amount END), 0) AS ledger
+  FROM wallet_owner.wallet w
+  LEFT JOIN wallet_owner.wallet_transaction t ON t.wallet_id = w.id
+ GROUP BY w.id, w.balance
+HAVING w.balance <> NVL(SUM(CASE t.type WHEN 'CREDIT' THEN t.amount ELSE -t.amount END), 0);
+```
+
+Se essa consulta devolver linha, o problema não é de aplicação: é escrita fora do package ou
+alteração manual de saldo, e a trilha em `WALLET_AUDIT.BALANCE_AUDIT` mostra qual.
+
+### 7.4 O que não existe
+
+Sem tracing distribuído (não há coletor no compose) e sem mensageria. Evento de carteira exigiria
+outbox transacional no schema; o motivo de não estar aqui está em [DECISIONS.md](DECISIONS.md).
+
+## 8. Testes
+
+```bash
+mvn test      # 82 testes: domínio, serviço, métricas, contrato HTTP (MockMvc) - não precisa de banco
 mvn verify    # acima + testes de integração com Oracle real (Testcontainers)
 ```
 
 | Suíte | O que cobre |
 |---|---|
 | `AmountsTest`, `IdempotencyKeysTest`, `RequestFingerprintTest` | regras de valor (2 casas, > 0, limite da coluna), formato da chave, determinismo do fingerprint |
-| `WalletApplicationServiceTest` | validação de entrada, 404, paginação/offset, normalização do payload, propagação de erros |
+| `WalletApplicationServiceTest` | validação de entrada, 404, paginação/offset, normalização do payload, propagação de erros e contadores de métrica por desfecho |
 | `OracleErrorTranslatorTest` | `ORA-20xxx` → `ErrorCode`, extração da mensagem, deadlock/unique/indisponibilidade |
-| `WalletControllerTest` | status HTTP, `Location`, header `Idempotent-Replayed`, corpo de erro RFC 9457, validação, 401/405/415, `X-Request-Id` |
-| `WalletApiIT` | 18 testes de fluxo completo contra Oracle real: idempotência, concorrência, imutabilidade, privilégios, auditoria, filtros do extrato |
+| `WalletMetricsTest` | contador e timer por `operation`, `outcome` e `type`, incluindo tipo nulo |
+| `WalletControllerTest` | status HTTP, `Location`, header `Idempotent-Replayed`, corpo de erro RFC 9457, validação, 401/405/406/415, `X-Request-Id` |
+| `WalletApiIT` | 19 testes de fluxo completo contra Oracle real: idempotência, concorrência, imutabilidade, privilégios, auditoria, filtros do extrato e métricas expostas no Prometheus |
 
 Os testes de integração sobem o container `gvenzl/oracle-free` com o mesmo bootstrap do compose e
 deixam o Flyway aplicar as migrações: é o caminho de produção. Sem Docker eles são **ignorados**
@@ -436,7 +519,7 @@ deixam o Flyway aplicar as migrações: é o caminho de produção. Sem Docker e
 
 ---
 
-## 8. Estrutura do projeto
+## 9. Estrutura do projeto
 
 ```
 wallet-api/
@@ -456,7 +539,7 @@ wallet-api/
 
 ---
 
-## 9. Decisões técnicas
+## 10. Decisões técnicas
 
 Estão detalhadas, com alternativas e trade-offs, em **[DECISIONS.md](DECISIONS.md)**. Resumo:
 
@@ -472,13 +555,13 @@ Estão detalhadas, com alternativas e trade-offs, em **[DECISIONS.md](DECISIONS.
 
 ---
 
-## 10. Escopo não implementado (e por quê)
+## 11. Escopo não implementado (e por quê)
 
 O enunciado pede foco: "escopo menor, bem-feito e bem-defendido". Ficaram fora, conscientemente:
 
 * múltiplas moedas, câmbio, juros, autenticação de usuário final (JWT/OAuth), agendamento,
   estorno/chargeback e frontend: fora de escopo pelo enunciado;
 * transferência entre carteiras, limite diário de débito, job de conciliação com `DBMS_SCHEDULER`,
-  teste de carga k6 e métricas Prometheus: itens "plus", não obrigatórios. O desenho atual
+  teste de carga k6 e tracing distribuído: itens "plus", não obrigatórios. O desenho atual
   (lock por linha, package transacional, extrato imutável) é a base direta para eles; o que eu
   faria em seguida está em [DECISIONS.md](DECISIONS.md#adr-11-o-que-eu-faria-com-mais-tempo).

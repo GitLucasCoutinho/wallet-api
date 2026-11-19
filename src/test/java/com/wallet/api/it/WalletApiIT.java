@@ -100,6 +100,10 @@ class WalletApiIT {
         registry.add("spring.flyway.password", () -> OWNER_PASSWORD);
         registry.add("spring.flyway.connect-retries", () -> "10");
         registry.add("wallet.security.api-keys", () -> API_KEY);
+        // @SpringBootTest disables metric export by default; the scrape endpoint is part of the
+        // contract we verify here, so it is enabled explicitly.
+        registry.add("management.defaults.metrics.export.enabled", () -> "true");
+        registry.add("management.prometheus.metrics.export.enabled", () -> "true");
     }
 
     @Autowired
@@ -477,6 +481,26 @@ class WalletApiIT {
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
         assertThat(response.getBody().code()).isEqualTo("MISSING_IDEMPOTENCY_KEY");
         assertThat(statementCount(walletId)).isZero();
+    }
+
+    @Test
+    void prometheusExposesTheOutcomeOfEachOperation() {
+        long walletId = newWallet("Metrics");
+        apply(walletId, "CREDIT", "10.00", uniqueKey("metric"));
+        applyExpectingError(walletId, "DEBIT", "999.00", uniqueKey("metric2"));
+
+        HttpHeaders prometheusHeaders = headers(null);
+        prometheusHeaders.setAccept(List.of(MediaType.TEXT_PLAIN));
+
+        ResponseEntity<String> response = rest.exchange("/actuator/prometheus", HttpMethod.GET,
+                new HttpEntity<>(prometheusHeaders), String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getBody())
+                .contains("wallet_operations_total")
+                .contains("outcome=\"applied\"")
+                .contains("outcome=\"insufficient_funds\"")
+                .contains("operation=\"register_transaction\"");
     }
 
     // ---------------------------------------------------------------------------------

@@ -282,6 +282,14 @@ class WalletControllerTest {
     }
 
     @Test
+    void unacceptableResponseTypeReturns406() throws Exception {
+        mockMvc.perform(get("/api/v1/wallets/1")
+                        .header(API_KEY_HEADER, API_KEY)
+                        .accept(MediaType.APPLICATION_XML))
+                .andExpect(status().isNotAcceptable());
+    }
+
+    @Test
     void unknownPathReturns404() throws Exception {
         mockMvc.perform(get("/api/v1/nope").header(API_KEY_HEADER, API_KEY))
                 .andExpect(status().isNotFound())

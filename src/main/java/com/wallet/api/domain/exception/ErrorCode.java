@@ -32,6 +32,7 @@ public enum ErrorCode {
     RESOURCE_NOT_FOUND(HttpStatus.NOT_FOUND, "Recurso não encontrado"),
     METHOD_NOT_ALLOWED(HttpStatus.METHOD_NOT_ALLOWED, "Método não permitido"),
     UNSUPPORTED_MEDIA_TYPE(HttpStatus.UNSUPPORTED_MEDIA_TYPE, "Tipo de mídia não suportado"),
+    NOT_ACCEPTABLE(HttpStatus.NOT_ACCEPTABLE, "Formato de resposta não suportado"),
 
     CONCURRENT_MODIFICATION(HttpStatus.SERVICE_UNAVAILABLE, "Conflito de concorrência, tente novamente"),
     DATABASE_UNAVAILABLE(HttpStatus.SERVICE_UNAVAILABLE, "Banco de dados indisponível"),

@@ -10,9 +10,12 @@ import com.wallet.api.domain.Wallet;
 import com.wallet.api.domain.WalletRepository;
 import com.wallet.api.domain.WalletTransaction;
 import com.wallet.api.domain.exception.ErrorCode;
+import com.wallet.api.domain.exception.InsufficientFundsException;
 import com.wallet.api.domain.exception.InvalidRequestException;
 import com.wallet.api.domain.exception.WalletException;
 import com.wallet.api.domain.exception.WalletNotFoundException;
+import com.wallet.api.observability.WalletMetrics;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -46,6 +49,8 @@ class WalletApplicationServiceTest {
     @Mock
     private WalletRepository repository;
 
+    private final SimpleMeterRegistry meterRegistry = new SimpleMeterRegistry();
+
     private WalletApplicationService service;
 
     @BeforeEach
@@ -53,7 +58,7 @@ class WalletApplicationServiceTest {
         PaginationProperties pagination = new PaginationProperties();
         pagination.setDefaultPageSize(20);
         pagination.setMaxPageSize(100);
-        service = new WalletApplicationService(repository, pagination);
+        service = new WalletApplicationService(repository, pagination, new WalletMetrics(meterRegistry));
     }
 
     @Test
@@ -264,5 +269,53 @@ class WalletApplicationServiceTest {
                 new BigDecimal("10.00"), "pix", "key-000001");
 
         assertThat(result).isSameAs(receipt);
+    }
+
+    @Test
+    void registerTransactionCountsAppliedOutcome() {
+        when(repository.register(eq(7L), any())).thenReturn(new TransactionReceipt(
+                7L, 1L, TransactionType.CREDIT, new BigDecimal("10.00"), new BigDecimal("10.00"), NOW, false));
+
+        service.registerTransaction(7L, TransactionType.CREDIT, new BigDecimal("10.00"), "pix", "key-000001");
+
+        assertThat(metric("applied", "CREDIT")).isEqualTo(1.0);
+    }
+
+    @Test
+    void registerTransactionCountsReplayOutcome() {
+        when(repository.register(eq(7L), any())).thenReturn(new TransactionReceipt(
+                7L, 1L, TransactionType.CREDIT, new BigDecimal("10.00"), new BigDecimal("10.00"), NOW, true));
+
+        service.registerTransaction(7L, TransactionType.CREDIT, new BigDecimal("10.00"), "pix", "key-000001");
+
+        assertThat(metric("replayed", "CREDIT")).isEqualTo(1.0);
+    }
+
+    @Test
+    void registerTransactionCountsDatabaseRejectionByErrorCode() {
+        when(repository.register(eq(7L), any()))
+                .thenThrow(new InsufficientFundsException("balance 0.00 is lower than 10.00"));
+
+        assertThatThrownBy(() -> service.registerTransaction(7L, TransactionType.DEBIT,
+                new BigDecimal("10.00"), "pix", "key-000001"))
+                .isInstanceOf(InsufficientFundsException.class);
+
+        assertThat(metric("insufficient_funds", "DEBIT")).isEqualTo(1.0);
+    }
+
+    @Test
+    void registerTransactionCountsValidationRejection() {
+        assertThatThrownBy(() -> service.registerTransaction(7L, TransactionType.DEBIT,
+                new BigDecimal("10.005"), "pix", "key-000001"))
+                .isInstanceOf(InvalidRequestException.class);
+
+        assertThat(metric("invalid_amount", "DEBIT")).isEqualTo(1.0);
+    }
+
+    private double metric(String outcome, String type) {
+        var counter = meterRegistry.find("wallet.operations")
+                .tags("operation", "register_transaction", "outcome", outcome, "type", type)
+                .counter();
+        return counter == null ? 0.0 : counter.count();
     }
 }

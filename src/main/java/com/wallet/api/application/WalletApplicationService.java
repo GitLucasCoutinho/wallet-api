@@ -13,7 +13,13 @@ import com.wallet.api.domain.Wallet;
 import com.wallet.api.domain.WalletRepository;
 import com.wallet.api.domain.exception.ErrorCode;
 import com.wallet.api.domain.exception.InvalidRequestException;
+import com.wallet.api.domain.exception.WalletException;
 import com.wallet.api.domain.exception.WalletNotFoundException;
+import com.wallet.api.observability.WalletMetrics;
+import io.micrometer.core.instrument.Timer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.slf4j.MDC;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
@@ -26,28 +32,52 @@ import java.util.List;
  * consistency decision to the database: the balance rule, the row lock and the idempotency check
  * are all inside {@code PKG_WALLET}. Nothing here opens a transaction - the stored procedure owns
  * it - so a request can never leave a half applied operation behind.
+ *
+ * <p>Observability: each use case is measured (outcome and duration) and the wallet id travels in
+ * the MDC, so every log line of one request can be correlated by {@code walletId} plus the
+ * {@code requestId} set by the filter.
  */
 @Service
 public class WalletApplicationService {
+
+    private static final Logger log = LoggerFactory.getLogger(WalletApplicationService.class);
 
     private static final int MAX_HOLDER_NAME_LENGTH = 120;
     private static final int MAX_HOLDER_DOCUMENT_LENGTH = 32;
     private static final int MAX_DESCRIPTION_LENGTH = 255;
 
+    private static final String CREATE_WALLET = "create_wallet";
+    private static final String REGISTER_TRANSACTION = "register_transaction";
+
     private final WalletRepository repository;
     private final PaginationProperties pagination;
+    private final WalletMetrics metrics;
 
-    public WalletApplicationService(WalletRepository repository, PaginationProperties pagination) {
+    public WalletApplicationService(WalletRepository repository, PaginationProperties pagination,
+                                    WalletMetrics metrics) {
         this.repository = repository;
         this.pagination = pagination;
+        this.metrics = metrics;
     }
 
     public Wallet createWallet(String holderName, String holderDocument) {
-        String name = normalizeRequiredText(holderName, MAX_HOLDER_NAME_LENGTH,
-                ErrorCode.INVALID_HOLDER, "nome do titular");
-        String document = normalizeOptionalText(holderDocument, MAX_HOLDER_DOCUMENT_LENGTH,
-                ErrorCode.INVALID_HOLDER, "documento do titular");
-        return repository.create(name, document);
+        Timer.Sample sample = metrics.start();
+        try {
+            String name = normalizeRequiredText(holderName, MAX_HOLDER_NAME_LENGTH,
+                    ErrorCode.INVALID_HOLDER, "nome do titular");
+            String document = normalizeOptionalText(holderDocument, MAX_HOLDER_DOCUMENT_LENGTH,
+                    ErrorCode.INVALID_HOLDER, "documento do titular");
+            Wallet wallet = repository.create(name, document);
+            metrics.applied(CREATE_WALLET, null, sample);
+            log.info("wallet created walletId={} currency={}", wallet.id(), wallet.currency());
+            return wallet;
+        } catch (WalletException exception) {
+            metrics.rejected(CREATE_WALLET, null, exception.code(), sample);
+            throw exception;
+        } catch (RuntimeException exception) {
+            metrics.failed(CREATE_WALLET, null, sample);
+            throw exception;
+        }
     }
 
     public Wallet getWallet(long walletId) {
@@ -84,18 +114,45 @@ public class WalletApplicationService {
     public TransactionReceipt registerTransaction(long walletId, TransactionType type,
                                                   BigDecimal amount, String description,
                                                   String idempotencyKey) {
-        if (type == null) {
-            throw new InvalidRequestException(ErrorCode.INVALID_TRANSACTION_TYPE, "tipo é obrigatório");
-        }
-        BigDecimal normalizedAmount = Amounts.normalize(amount);
-        String key = IdempotencyKeys.requireValid(idempotencyKey);
-        String normalizedDescription = normalizeOptionalText(description, MAX_DESCRIPTION_LENGTH,
-                ErrorCode.INVALID_DESCRIPTION, "descrição");
+        Timer.Sample sample = metrics.start();
+        try (MDC.MDCCloseable wallet = MDC.putCloseable("walletId", Long.toString(walletId));
+             MDC.MDCCloseable key = MDC.putCloseable("idempotencyKey",
+                     idempotencyKey == null || idempotencyKey.isBlank() ? "-" : idempotencyKey)) {
 
-        String fingerprint = RequestFingerprint.of(type, normalizedAmount, normalizedDescription);
-        RegisterTransactionCommand command = new RegisterTransactionCommand(
-                type, normalizedAmount, normalizedDescription, key, fingerprint);
-        return repository.register(walletId, command);
+            if (type == null) {
+                throw new InvalidRequestException(ErrorCode.INVALID_TRANSACTION_TYPE, "tipo é obrigatório");
+            }
+            BigDecimal normalizedAmount = Amounts.normalize(amount);
+            String validKey = IdempotencyKeys.requireValid(idempotencyKey);
+            String normalizedDescription = normalizeOptionalText(description, MAX_DESCRIPTION_LENGTH,
+                    ErrorCode.INVALID_DESCRIPTION, "descrição");
+
+            String fingerprint = RequestFingerprint.of(type, normalizedAmount, normalizedDescription);
+            RegisterTransactionCommand command = new RegisterTransactionCommand(
+                    type, normalizedAmount, normalizedDescription, validKey, fingerprint);
+
+            TransactionReceipt receipt = repository.register(walletId, command);
+
+            if (receipt.replayed()) {
+                metrics.replayed(REGISTER_TRANSACTION, type, sample);
+                log.info("operation replayed transactionId={} type={} amount={}",
+                        receipt.transactionId(), type, normalizedAmount);
+            } else {
+                metrics.applied(REGISTER_TRANSACTION, type, sample);
+                log.info("operation applied transactionId={} type={} amount={} balanceAfter={}",
+                        receipt.transactionId(), type, normalizedAmount, receipt.balanceAfter());
+            }
+            return receipt;
+        } catch (WalletException exception) {
+            metrics.rejected(REGISTER_TRANSACTION, type, exception.code(), sample);
+            log.warn("operation rejected code={} type={} amount={} detail={}",
+                    exception.code(), type, amount, exception.detail());
+            throw exception;
+        } catch (RuntimeException exception) {
+            metrics.failed(REGISTER_TRANSACTION, type, sample);
+            log.error("operation failed type={} amount={}", type, amount, exception);
+            throw exception;
+        }
     }
 
     private static String normalizeRequiredText(String raw, int maxLength, ErrorCode code, String field) {

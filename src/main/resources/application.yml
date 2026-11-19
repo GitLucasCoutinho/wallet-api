@@ -53,12 +53,15 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,info,metrics
+        include: health,info,metrics,prometheus
   endpoint:
     health:
       show-details: never
       probes:
         enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}
   info:
     env:
       enabled: true
@@ -84,6 +87,11 @@ wallet:
     max-page-size: ${WALLET_MAX_PAGE_SIZE:100}
 
 logging:
+  # JSON por linha (ECS): pronto para Loki/CloudWatch/ELK. O requestId, walletId e
+  # idempotencyKey saem do MDC como campos consultaveis.
+  structured:
+    format:
+      console: ecs
   level:
     root: INFO
     com.wallet.api: ${LOG_LEVEL:INFO}

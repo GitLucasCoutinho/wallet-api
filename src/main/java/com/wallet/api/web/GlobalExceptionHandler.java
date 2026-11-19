@@ -13,6 +13,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.web.HttpMediaTypeNotAcceptableException;
 import org.springframework.web.HttpMediaTypeNotSupportedException;
 import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
@@ -40,7 +41,7 @@ import java.util.List;
 public class GlobalExceptionHandler {
 
     private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
-    private static final String WRITE_ERROR_LOG = "request failed with {}: {}";
+    private static final String WRITE_ERROR_LOG = "request out of the happy path code={} detail={} path={}";
 
     private final ApiErrorFactory errorFactory;
     private final OracleErrorTranslator errorTranslator;
@@ -53,7 +54,7 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(WalletException.class)
     public ResponseEntity<ApiErrorResponse> handleWalletException(WalletException exception,
                                                                   HttpServletRequest request) {
-        logIfServerError(exception.code(), exception);
+        logRejection(exception.code(), exception.detail(), request, exception);
         return respond(exception.code(), exception.detail(), request, null);
     }
 
@@ -117,6 +118,13 @@ public class GlobalExceptionHandler {
                 "tipo de conteúdo não suportado; use application/json", request, null);
     }
 
+    @ExceptionHandler(HttpMediaTypeNotAcceptableException.class)
+    public ResponseEntity<ApiErrorResponse> handleNotAcceptable(HttpMediaTypeNotAcceptableException exception,
+                                                                HttpServletRequest request) {
+        return respond(ErrorCode.NOT_ACCEPTABLE,
+                "nenhuma representação disponível para o Accept enviado", request, null);
+    }
+
     @ExceptionHandler(NoResourceFoundException.class)
     public ResponseEntity<ApiErrorResponse> handleNoResource(NoResourceFoundException exception,
                                                              HttpServletRequest request) {
@@ -127,13 +135,14 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ApiErrorResponse> handleDataAccess(DataAccessException exception,
                                                              HttpServletRequest request) {
         WalletException translated = errorTranslator.translate(exception);
-        logIfServerError(translated.code(), translated);
+        logRejection(translated.code(), translated.detail(), request, translated);
         return respond(translated.code(), translated.detail(), request, null);
     }
 
     @ExceptionHandler(Exception.class)
     public ResponseEntity<ApiErrorResponse> handleUnexpected(Exception exception, HttpServletRequest request) {
-        log.error(WRITE_ERROR_LOG, ErrorCode.INTERNAL_ERROR, exception.getMessage(), exception);
+        log.error(WRITE_ERROR_LOG, ErrorCode.INTERNAL_ERROR, exception.getMessage(),
+                request.getRequestURI(), exception);
         return respond(ErrorCode.INTERNAL_ERROR, "erro interno inesperado", request, null);
     }
 
@@ -146,12 +155,21 @@ public class GlobalExceptionHandler {
                 .body(body);
     }
 
-    private void logIfServerError(ErrorCode code, Exception exception) {
+    /**
+     * Severity follows what an operator needs to see: 5xx is an incident and carries the stack;
+     * a business rejection (409/422) is a warning with the path, because it changes the client's
+     * behaviour; a plain 400 is client noise and stays at debug.
+     */
+    private void logRejection(ErrorCode code, String detail, HttpServletRequest request, Exception exception) {
         if (code.status().is5xxServerError() || code.status() == HttpStatus.SERVICE_UNAVAILABLE) {
-            log.error(WRITE_ERROR_LOG, code, exception.getMessage(), exception);
-        } else {
-            log.debug(WRITE_ERROR_LOG, code, exception.getMessage());
+            log.error(WRITE_ERROR_LOG, code, detail, request.getRequestURI(), exception);
+            return;
         }
+        if (code.status() == HttpStatus.CONFLICT || code.status() == HttpStatus.UNPROCESSABLE_ENTITY) {
+            log.info(WRITE_ERROR_LOG, code, detail, request.getRequestURI());
+            return;
+        }
+        log.debug(WRITE_ERROR_LOG, code, detail, request.getRequestURI());
     }
 
     private static String lastNode(ConstraintViolation<?> violation) {
